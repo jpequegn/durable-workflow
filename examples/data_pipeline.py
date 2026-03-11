@@ -1,43 +1,72 @@
-"""Example: download → transform → load → notify data pipeline.
+"""Example: download → transform → load → notify ETL pipeline.
 
-Placeholder — will be wired to the engine in a future issue.
+Demonstrates a 4-step durable ETL workflow.
+
+Usage
+-----
+    uv run wf run examples/data_pipeline.py --source-url https://example.com/data.csv --table staging
+    uv run wf status <run_id>
 """
 
-# from workflow import workflow, step, WorkflowEngine
+from __future__ import annotations
+
+from workflow.step import step
+
+
+# ---------------------------------------------------------------------------
+# Step functions — pure, no engine awareness
+# ---------------------------------------------------------------------------
 
 
 def download_data(source_url: str) -> bytes:
-    print(f"[download_data] url={source_url}")
-    return b"raw,data,here"
+    """Fetch raw data from *source_url*. Returns raw bytes."""
+    print(f"  [download_data] Fetching {source_url} …")
+    return b"id,name,value\n1,foo,42\n2,bar,99\n"
 
 
 def transform_data(raw: bytes) -> list[dict]:
-    print(f"[transform_data] bytes={len(raw)}")
-    return [{"col": "value"}]
+    """Parse CSV bytes into a list of dicts."""
+    print(f"  [transform_data] Parsing {len(raw)} bytes …")
+    lines = raw.decode().strip().splitlines()
+    headers = lines[0].split(",")
+    records = [dict(zip(headers, line.split(","))) for line in lines[1:]]
+    print(f"  [transform_data] {len(records)} records parsed")
+    return records
 
 
 def load_to_db(records: list[dict], table: str) -> int:
-    print(f"[load_to_db] table={table} rows={len(records)}")
+    """Simulate inserting records into *table*. Returns row count."""
+    print(f"  [load_to_db] Inserting {len(records)} rows into {table!r} …")
     return len(records)
 
 
-def notify(rows_written: int) -> None:
-    print(f"[notify] Wrote {rows_written} rows — pipeline complete.")
+def notify(rows_written: int) -> str:
+    """Emit a completion notification."""
+    msg = f"ETL complete — {rows_written} rows written."
+    print(f"  [notify] {msg}")
+    return msg
 
 
-# @workflow
-# def etl_pipeline(source_url: str, table: str):
-#     raw          = step("download",  download_data, source_url)
-#     records      = step("transform", transform_data, raw)
-#     rows_written = step("load",      load_to_db, records, table)
-#     step("notify", notify, rows_written)
+# ---------------------------------------------------------------------------
+# Workflow function
+# ---------------------------------------------------------------------------
 
 
-if __name__ == "__main__":
-    source_url = "https://example.com/data.csv"
-    table = "staging"
+def etl_pipeline(source_url: str, table: str) -> str:
+    """4-step durable ETL: download → transform → load → notify."""
+    raw          = step("download",  download_data,  source_url)
+    records      = step("transform", transform_data, raw)
+    rows_written = step("load",      load_to_db,     records, table)
+    return         step("notify",    notify,          rows_written)
 
-    raw = download_data(source_url)
-    records = transform_data(raw)
-    rows_written = load_to_db(records, table)
-    notify(rows_written)
+
+# ---------------------------------------------------------------------------
+# CLI discovery hooks
+# ---------------------------------------------------------------------------
+
+WORKFLOW = etl_pipeline
+
+INPUT_SCHEMA: dict[str, type] = {
+    "source_url": str,
+    "table": str,
+}
