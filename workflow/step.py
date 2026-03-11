@@ -10,7 +10,13 @@ How it works
 3. Write a RUNNING record to the store (durability checkpoint *before* work).
 4. Call ``func(*args, **kwargs)``.
 5. On success  → write COMPLETED + ``pickle.dumps(result)`` → return result.
-6. On exception → write FAILED + error message → re-raise.
+6. On exception → write FAILED + error message.
+   - If ``attempt < max_retries``: sleep ``base_delay * 2 ** attempt`` seconds,
+     increment attempt, go to step 3.
+   - Otherwise: re-raise the original exception.
+
+Each retry is a **new row** in ``step_records`` with an incremented ``attempt``
+number so the full history is always inspectable via ``status()``.
 
 The current ``run_id`` is picked up transparently from a ``ContextVar`` so
 callers never have to thread it through manually.
@@ -20,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+import time
 import traceback
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -94,14 +101,26 @@ def _compute_input_hash(*args: Any, **kwargs: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def step(name: str, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+def step(
+    name: str,
+    func: Callable[..., T],
+    *args: Any,
+    max_retries: int = 0,
+    base_delay: float = 1.0,
+    **kwargs: Any,
+) -> T:
     """Execute *func* as a durable, idempotent workflow step.
 
     Args:
-        name:   Logical name for this step (must be unique within a workflow).
-        func:   The callable to execute.
-        *args:  Positional arguments forwarded to *func*.
-        **kwargs: Keyword arguments forwarded to *func*.
+        name:        Logical name for this step (must be unique within a workflow).
+        func:        The callable to execute.
+        *args:       Positional arguments forwarded to *func*.
+        max_retries: Number of additional attempts after the first failure.
+                     ``0`` means no retries (default).  Total attempts = ``max_retries + 1``.
+        base_delay:  Base sleep time in seconds for exponential backoff.
+                     Attempt *k* sleeps ``base_delay * 2 ** k`` seconds before
+                     retrying (k=0 on first retry, k=1 on second, …).
+        **kwargs:    Keyword arguments forwarded to *func*.
 
     Returns:
         The return value of ``func(*args, **kwargs)`` — either freshly computed
@@ -109,7 +128,8 @@ def step(name: str, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
 
     Raises:
         RuntimeError: if called outside a workflow execution context.
-        Exception:    Whatever *func* raises, after recording FAILED in the store.
+        Exception:    Whatever *func* raises on the final attempt, after all
+                      retries are exhausted.
     """
     store, run_id = get_current_run()
     input_hash = _compute_input_hash(*args, **kwargs)
@@ -120,33 +140,45 @@ def step(name: str, func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         # Cache hit: return the previously stored result without re-executing.
         return pickle.loads(existing.output)  # type: ignore[return-value]
 
-    # --- 2. Determine attempt number ------------------------------------------
+    # --- 2. Determine starting attempt number ---------------------------------
+    # Resume after a prior failure: pick up where we left off.
     attempt = 0 if existing is None else existing.attempt + 1
 
-    # --- 3. Write RUNNING checkpoint (before execution) -----------------------
-    store.write_step(run_id, name, attempt=attempt, status="running", input_hash=input_hash)
+    # --- 3-6. Execute with retry loop -----------------------------------------
+    while True:
+        # Checkpoint RUNNING before doing any work.
+        store.write_step(run_id, name, attempt=attempt, status="running", input_hash=input_hash)
 
-    # --- 4 & 5. Execute and persist result ------------------------------------
-    try:
-        result: T = func(*args, **kwargs)
-    except Exception as exc:
-        # --- 6. Persist failure and propagate ---------------------------------
+        try:
+            result: T = func(*args, **kwargs)
+        except Exception:
+            error_text = traceback.format_exc()
+            store.write_step(
+                run_id,
+                name,
+                attempt=attempt,
+                status="failed",
+                input_hash=input_hash,
+                error=error_text,
+            )
+
+            retries_remaining = max_retries - attempt
+            if retries_remaining > 0:
+                # Exponential backoff before next attempt.
+                delay = base_delay * (2 ** attempt)
+                time.sleep(delay)
+                attempt += 1
+                continue  # retry
+            else:
+                raise  # all attempts exhausted — propagate
+
+        # Success
         store.write_step(
             run_id,
             name,
             attempt=attempt,
-            status="failed",
+            status="completed",
             input_hash=input_hash,
-            error=traceback.format_exc(),
+            output=pickle.dumps(result),
         )
-        raise
-
-    store.write_step(
-        run_id,
-        name,
-        attempt=attempt,
-        status="completed",
-        input_hash=input_hash,
-        output=pickle.dumps(result),
-    )
-    return result
+        return result
