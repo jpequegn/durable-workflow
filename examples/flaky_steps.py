@@ -1,49 +1,85 @@
-"""Example: intentional failures for testing retry / resume behaviour.
+"""Example: intentional failures demonstrating retry and resume behaviour.
 
-Placeholder — will be wired to the engine in a future issue.
+Shows how max_retries + exponential backoff works for transient failures
+(network blips, rate limits, model API timeouts, etc.).
+
+Usage
+-----
+    # Run — step_b will fail twice then succeed
+    uv run wf run examples/flaky_steps.py --seed 42
+
+    # Inspect the retry history
+    uv run wf runs inspect <run_id> --show-output
 """
+
+from __future__ import annotations
 
 import random
 
-# from workflow import workflow, step, WorkflowEngine
+from workflow.step import step
+
+
+# ---------------------------------------------------------------------------
+# Simulated exception
+# ---------------------------------------------------------------------------
 
 
 class SimulatedCrash(Exception):
-    """Raised intentionally to simulate a mid-workflow process crash."""
+    """Raised intentionally to simulate a transient failure."""
 
 
-def flaky_step(name: str, fail_probability: float = 0.5) -> str:
-    """Succeed or fail randomly, for chaos testing."""
-    if random.random() < fail_probability:
-        raise SimulatedCrash(f"[{name}] Simulated crash!")
-    print(f"[{name}] Success")
-    return f"{name}_result"
+# ---------------------------------------------------------------------------
+# Step functions
+# ---------------------------------------------------------------------------
 
 
-def always_succeeds(value: str) -> str:
-    print(f"[always_succeeds] got={value!r}")
-    return value.upper()
+def flaky_fetch(seed: int, fail_times: int = 2) -> str:
+    """Simulate a network fetch that fails *fail_times* before succeeding.
+
+    Uses a module-level counter so retries (same call) advance past the
+    failure threshold.
+    """
+    flaky_fetch._calls = getattr(flaky_fetch, "_calls", 0) + 1
+    if flaky_fetch._calls <= fail_times:
+        raise SimulatedCrash(f"Transient network error (attempt {flaky_fetch._calls})")
+    return f"raw_data_seed_{seed}"
 
 
-# @workflow
-# def chaos_workflow(seed: int):
-#     random.seed(seed)
-#     a = step("step_a", flaky_step, "step_a", fail_probability=0.5)
-#     b = step("step_b", flaky_step, "step_b", fail_probability=0.5)
-#     c = step("step_c", always_succeeds, a + b)
-#     return c
+def process(data: str) -> str:
+    print(f"  [process] data={data!r}")
+    return data.upper()
 
 
-if __name__ == "__main__":
-    # Run without durability to observe natural failure rate
-    import sys
+def save(result: str) -> dict:
+    print(f"  [save] result={result!r}")
+    return {"saved": True, "result": result}
 
-    seed = int(sys.argv[1]) if len(sys.argv) > 1 else 42
-    random.seed(seed)
-    try:
-        a = flaky_step("step_a", 0.5)
-        b = flaky_step("step_b", 0.5)
-        c = always_succeeds(a + b)
-        print(f"Result: {c}")
-    except SimulatedCrash as e:
-        print(f"Crashed: {e}")
+
+# ---------------------------------------------------------------------------
+# Workflow function
+# ---------------------------------------------------------------------------
+
+
+def flaky_pipeline(seed: int) -> dict:
+    """3-step pipeline where the first step is flaky (fails 2× before succeeding).
+
+    Demonstrates max_retries=3 with base_delay=0.0 (instant retries for the demo).
+    In production use base_delay=1.0 for exponential backoff.
+    """
+    # Reset per-run so each engine.run() starts fresh.
+    flaky_fetch._calls = 0
+
+    raw    = step("fetch",   flaky_fetch, seed, fail_times=2, max_retries=3, base_delay=0.0)
+    result = step("process", process,     raw)
+    return   step("save",    save,        result)
+
+
+# ---------------------------------------------------------------------------
+# CLI discovery hooks
+# ---------------------------------------------------------------------------
+
+WORKFLOW = flaky_pipeline
+
+INPUT_SCHEMA: dict[str, type] = {
+    "seed": int,
+}
